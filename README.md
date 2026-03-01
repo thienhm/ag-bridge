@@ -6,15 +6,7 @@
 
 ## How It Works
 
-```mermaid
-graph LR
-    A["📱<br/>Telegram App"] -->|prompt| B["🤖<br/>ag-bridge Bot"]
-    B -->|command| C["🔌<br/>Unix Socket"]
-    C -->|execute| D["🧠<br/>Your Workspace"]
-    D -->|result| C
-    C -->|response| B
-    B -->|reply| A
-```
+![How ag-bridge works](docs/architecture.png)
 
 1. You send a message to your Telegram bot from your phone
 2. The bot forwards it through a Unix domain socket to a watching Antigravity session
