@@ -6,7 +6,15 @@
 
 ## How It Works
 
-![How ag-bridge works](docs/architecture.png)
+```mermaid
+graph LR
+    A["📱<br/>Telegram App"] -->|prompt| B["🤖<br/>ag-bridge Bot"]
+    B -->|command| C["🔌<br/>Unix Socket"]
+    C -->|execute| D["🧠<br/>Your Workspace"]
+    D -->|result| C
+    C -->|response| B
+    B -->|reply| A
+```
 
 1. You send a message to your Telegram bot from your phone
 2. The bot forwards it through a Unix domain socket to a watching Antigravity session
@@ -25,7 +33,7 @@
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/thienhm/ag-bridge.git ~/.ag-bridge
+git clone <your-repo-url> ~/.ag-bridge
 ```
 
 ### 2. Install dependencies
@@ -67,7 +75,17 @@ This copies the `bridge-watcher` skill into `.agent/skills/bridge-watcher/`.
 
 ## Usage
 
-### Connect
+### 1. Start the bot
+
+In a **separate terminal**, start the bridge bot:
+
+```bash
+ag-bridge start
+```
+
+Keep this terminal open — the bot runs in the foreground.
+
+### 2. Connect Antigravity
 
 Open a **dedicated Antigravity workspace** in your IDE and say:
 
@@ -77,13 +95,13 @@ or simply:
 
 > Start ag-bridge
 
-Antigravity will auto-start the bot if needed, connect to it, and you'll receive a Telegram notification:
+Antigravity will connect to the bot and you'll receive a Telegram notification:
 
 > 🟢 **Antigravity session active**
 > Workspace: `your-project`
 > Ready to receive commands.
 
-> **Tip:** You can also start the bot manually with `ag-bridge start` if you prefer to run it independently.
+> **Why start the bot separately?** Running the bot outside of Antigravity keeps the AI session lean — it doesn't waste context tokens on bot process management, which means longer bridge sessions before context exhaustion.
 
 ### Send commands
 

@@ -11,9 +11,37 @@ This skill turns your Antigravity session into a remote command processor.
 It connects to the Telegram bridge bot via a Unix domain socket and waits
 for commands sent from your phone via Telegram.
 
+## Context Economy (MANDATORY)
+
+> Every token in this conversation is finite. The bridge must survive for hours
+> and dozens of commands. These rules are non-negotiable.
+
+### Watch Loop Rules
+
+- **`WaitDurationSeconds=300`** on every `command_status` poll (returns early when a command arrives)
+- **`OutputCharacterCount=500`** on every `command_status` poll
+- **ZERO text output** when no command is found — immediately poll again with no commentary
+- **Never re-read** this skill file, config files, or any reference docs after initial setup
+
+### Command Execution Rules
+
+- **Cap all tool outputs** — use the smallest reasonable `OutputCharacterCount` and line ranges
+- **No reasoning narration** — don't explain what you're about to do, just do it
+- **No acknowledgment** — don't say "I received a command to..." — execute immediately
+- **Terse Telegram results** — 1-3 sentences max, summarize don't echo raw output
+
+### DO NOT (Context Waste)
+
+- DO NOT produce any text response when no command is found in a poll
+- DO NOT re-read SKILL.md, config.json, or reference docs mid-session
+- DO NOT echo the command prompt back before executing it
+- DO NOT narrate your plan or reasoning process during execution
+- DO NOT include raw tool output in Telegram result summaries — always summarize
+- DO NOT print status messages like "Checking for commands..." or "No command found"
+
 ## Prerequisites
 
-- The bridge bot must be running: `python3 ~/.ag-bridge/bot.py`
+- The bridge bot must already be running in a separate terminal: `ag-bridge start`
 - Config must exist at `~/.ag-bridge/config.json` with valid bot_token and chat IDs
 
 ## Startup Procedure
@@ -39,24 +67,11 @@ Expected output:
 [bridge] Waiting for command...
 ```
 
-If you see `ERROR: Cannot connect`, the bot is not running. **Auto-start it:**
+If you see `ERROR: Cannot connect`, the bot is not running. **Tell the user:**
 
-1. Start the bot as a background command:
+> ⚠️ Bot is not running. Please start it in a separate terminal: `ag-bridge start`
 
-   ```
-   run_command: python3 ~/.ag-bridge/bot.py
-   ```
-
-   Use `WaitMsBeforeAsync=3000` to capture startup output.
-
-2. Check `command_status` to verify the bot started successfully. Look for:
-
-   ```
-   Starting Telegram bridge bot...
-   Socket server listening at ~/.ag-bridge/bridge.sock
-   ```
-
-3. Retry Step 1 — start the bridge client again and verify connection.
+Do NOT attempt to start the bot yourself — this wastes context tokens.
 
 **Step 3: Enter the watch loop.**
 
@@ -66,13 +81,13 @@ Repeat these steps indefinitely until the user says stop or sends `/stop` from T
 
 ### 1. Check for commands
 
-Call `command_status` on the bridge client process with `WaitDurationSeconds=30`.
+Call `command_status` on the bridge client process with `WaitDurationSeconds=300` and `OutputCharacterCount=500`.
 Look for lines containing `[COMMAND]` in the output.
 
 ### 2. If no command found
 
-The `command_status` call will return after 30 seconds if no command arrives.
-Simply check again — loop back to step 1.
+The `command_status` call will return after up to 5 minutes if no command arrives (it returns early when one does).
+Produce **zero text output**. Immediately loop back to step 1 with no commentary.
 
 ### 3. If command found
 
@@ -112,11 +127,10 @@ Do whatever the prompt asks, using your full capabilities.
 
 ### 6. Compose and send the result
 
-After completing the task, compose a concise summary of:
+Compose a **1-3 sentence** summary. Summarize, don't echo raw output. Include:
 
-- What you did
 - The outcome (success/failure)
-- Any important output or findings
+- Key finding or result (if any)
 
 Send the result back using `send_command_input` on the bridge client process:
 
@@ -140,8 +154,7 @@ Go back to step 1. Continue watching for the next command.
 - If a command fails or errors out, send a result with `"status": "error"`
   and describe the error in `summary`
 - If the bridge client process dies, restart it (go back to Startup step 1)
-- If the bot is not running, auto-start it: `python3 ~/.ag-bridge/bot.py`
-  as a background command, then retry the bridge client
+- If the bot is not running, tell the user to start it manually: `ag-bridge start`
 
 ## Shutdown Procedure
 
@@ -160,18 +173,13 @@ If the stop was received as a Telegram command, send a result back first:
 
 Use `send_command_input` with `Terminate: true` on the bridge client process.
 
-**Step 3: Terminate the bot (if auto-started).**
+The bot continues running in the user's terminal — do NOT attempt to terminate it.
 
-If the bot was auto-started during Startup Step 2, terminate it as well using
-`send_command_input` with `Terminate: true` on the bot process.
-
-If the bot was already running before this session, leave it running.
-
-**Step 4: Confirm to the user.**
+**Step 3: Confirm to the user.**
 
 Report to the user in the Antigravity chat:
 
-> 🔴 Bridge disconnected. Bot and client processes terminated.
+> 🔴 Bridge disconnected. Client process terminated. Bot is still running in your terminal.
 
 ## Example Session
 
