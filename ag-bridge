@@ -1,18 +1,16 @@
 #!/bin/bash
-# ag-bridge — CLI tool for managing the Telegram ↔ Antigravity bridge
+# ag-bridge — CLI tool for managing the Telegram ↔ Antigravity bridge (v2)
 #
 # Usage:
 #   ag-bridge onboard     First-time setup — configure bot token and chat ID
 #   ag-bridge configure   Edit an existing configuration value
-#   ag-bridge init        Install the bridge-watcher skill into the current workspace
 #   ag-bridge start       Start the bot daemon
-#   ag-bridge status      Show bot and skill status
+#   ag-bridge status      Show bot and CDP status
 #   ag-bridge help        Show this help message
 
 set -euo pipefail
 
 AG_BRIDGE_HOME="${AG_BRIDGE_HOME:-$HOME/.ag-bridge}"
-SKILL_SOURCE="$AG_BRIDGE_HOME/skill"
 CONFIG_FILE="$AG_BRIDGE_HOME/config.json"
 
 # Colors
@@ -23,63 +21,21 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 usage() {
-    echo -e "${BOLD}ag-bridge${NC} — Telegram ↔ Antigravity bridge"
+    echo -e "${BOLD}ag-bridge${NC} — Telegram ↔ Antigravity bridge (v2: CDP + HTTP callback)"
     echo ""
     echo "Usage:"
     echo "  ag-bridge onboard     First-time setup — configure bot token and chat ID"
     echo "  ag-bridge configure   Edit an existing configuration value"
-    echo "  ag-bridge init        Install the bridge-watcher skill into the current workspace"
     echo "  ag-bridge start       Start the bot daemon"
-    echo "  ag-bridge status      Show bot status"
+    echo "  ag-bridge status      Show bot and CDP status"
     echo "  ag-bridge help        Show this help message"
-}
-
-cmd_init() {
-    local target_dir=".agent/skills/bridge-watcher"
-
-    echo -e "${BOLD}Initializing ag-bridge in current workspace...${NC}"
-    echo "  Workspace: $(pwd)"
-
-    # Check if skill source exists
-    if [ ! -d "$SKILL_SOURCE" ]; then
-        echo -e "${RED}Error:${NC} Skill source not found at $SKILL_SOURCE"
-        echo "  Make sure ag-bridge is installed at $AG_BRIDGE_HOME"
-        exit 1
-    fi
-
-    # Check if already initialized
-    if [ -d "$target_dir" ]; then
-        echo -e "${YELLOW}Warning:${NC} bridge-watcher skill already exists at $target_dir"
-        read -p "  Overwrite? [y/N] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "  Aborted."
-            exit 0
-        fi
-        rm -rf "$target_dir"
-    fi
-
-    # Create directory structure
-    mkdir -p "$target_dir/scripts"
-
-    # Copy skill files
-    cp "$SKILL_SOURCE/SKILL.md" "$target_dir/SKILL.md"
-    cp "$SKILL_SOURCE/scripts/bridge_client.py" "$target_dir/scripts/bridge_client.py"
-    chmod +x "$target_dir/scripts/bridge_client.py"
-
-    echo -e "${GREEN}✅ bridge-watcher skill installed at:${NC} $target_dir"
     echo ""
-    echo "  Files added:"
-    echo "    $target_dir/SKILL.md"
-    echo "    $target_dir/scripts/bridge_client.py"
-    echo ""
-    echo -e "  ${BOLD}Next steps:${NC}"
-    echo "    1. Start the bot:  ag-bridge start"
-    echo "    2. Open an Antigravity tab and say: \"Watch the bridge for remote commands\""
+    echo "Prerequisite:"
+    echo "  Antigravity must be launched with --remote-debugging-port=9222"
 }
 
 cmd_onboard() {
-    echo -e "${BOLD}🤖 ag-bridge — First-time setup${NC}"
+    echo -e "${BOLD}🤖 ag-bridge v2 — First-time setup${NC}"
     echo ""
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -116,12 +72,24 @@ cmd_onboard() {
         exit 1
     fi
 
+    echo ""
+    echo -e "  ${BOLD}Step 3:${NC} CDP and callback ports (press Enter for defaults)"
+    echo ""
+
+    read -p "  CDP port [9222]: " cdp_port
+    cdp_port="${cdp_port:-9222}"
+
+    read -p "  Callback port [3001]: " callback_port
+    callback_port="${callback_port:-3001}"
+
     # Write config
+    mkdir -p "$AG_BRIDGE_HOME"
     cat > "$CONFIG_FILE" <<EOF
 {
   "bot_token": "$bot_token",
   "allowed_chat_ids": [$chat_id],
-  "socket_path": "~/.ag-bridge/bridge.sock"
+  "cdp_port": $cdp_port,
+  "callback_port": $callback_port
 }
 EOF
 
@@ -129,9 +97,8 @@ EOF
     echo -e "${GREEN}✅ Config saved to $CONFIG_FILE${NC}"
     echo ""
     echo -e "  ${BOLD}Next steps:${NC}"
-    echo "    1. Install the skill:  ag-bridge init"
-    echo "    2. Start the bot:     ag-bridge start"
-    echo "    3. Open an Antigravity tab and say: \"Watch the bridge for remote commands\""
+    echo "    1. Launch Antigravity with: /Applications/Antigravity.app/Contents/MacOS/Antigravity --remote-debugging-port=$cdp_port"
+    echo "    2. Start the bot: ag-bridge start"
 }
 
 cmd_configure() {
@@ -144,18 +111,22 @@ cmd_configure() {
     echo ""
 
     # Read current values
-    local current_token current_chat_ids
+    local current_token current_chat_ids current_cdp_port current_callback_port
     current_token=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['bot_token'])" 2>/dev/null || echo "")
     current_chat_ids=$(python3 -c "import json; print(','.join(str(x) for x in json.load(open('$CONFIG_FILE'))['allowed_chat_ids']))" 2>/dev/null || echo "")
+    current_cdp_port=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('cdp_port', 9222))" 2>/dev/null || echo "9222")
+    current_callback_port=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('callback_port', 3001))" 2>/dev/null || echo "3001")
 
     echo "  What would you like to update?"
     echo ""
-    echo "    1) Bot token     (current: ${current_token:0:10}...)"
-    echo "    2) Chat ID(s)    (current: $current_chat_ids)"
-    echo "    3) Cancel"
+    echo "    1) Bot token       (current: ${current_token:0:10}...)"
+    echo "    2) Chat ID(s)      (current: $current_chat_ids)"
+    echo "    3) CDP port        (current: $current_cdp_port)"
+    echo "    4) Callback port   (current: $current_callback_port)"
+    echo "    5) Cancel"
     echo ""
 
-    read -p "  Choose [1-3]: " choice
+    read -p "  Choose [1-5]: " choice
     echo ""
 
     case "$choice" in
@@ -193,7 +164,33 @@ with open('$CONFIG_FILE', 'w') as f:
 "
             echo -e "${GREEN}✅ Chat ID(s) updated.${NC}"
             ;;
-        3|"")
+        3)
+            read -p "  New CDP port: " new_port
+            python3 -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    config = json.load(f)
+config['cdp_port'] = int('$new_port')
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\\n')
+"
+            echo -e "${GREEN}✅ CDP port updated.${NC}"
+            ;;
+        4)
+            read -p "  New callback port: " new_port
+            python3 -c "
+import json
+with open('$CONFIG_FILE', 'r') as f:
+    config = json.load(f)
+config['callback_port'] = int('$new_port')
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\\n')
+"
+            echo -e "${GREEN}✅ Callback port updated.${NC}"
+            ;;
+        5|"")
             echo "  Cancelled."
             ;;
         *)
@@ -217,37 +214,30 @@ cmd_start() {
         exit 1
     fi
 
-    echo -e "${BOLD}Starting ag-bridge bot...${NC}"
+    echo -e "${BOLD}Starting ag-bridge v2...${NC}"
     python3 "$bot"
 }
 
 cmd_status() {
-    local socket_path
-    socket_path=$(python3 -c "import json,os; c=json.load(open(os.path.expanduser('$AG_BRIDGE_HOME/config.json'))); print(os.path.expanduser(c.get('socket_path','~/.ag-bridge/bridge.sock')))" 2>/dev/null || echo "$AG_BRIDGE_HOME/bridge.sock")
+    local cdp_port
+    cdp_port=$(python3 -c "import json; print(json.load(open('$AG_BRIDGE_HOME/config.json')).get('cdp_port', 9222))" 2>/dev/null || echo "9222")
 
-    echo -e "${BOLD}ag-bridge status${NC}"
+    echo -e "${BOLD}ag-bridge v2 status${NC}"
     echo ""
 
     # Check if bot is running
     if pgrep -f "ag-bridge/bot.py" > /dev/null 2>&1; then
-        echo -e "  Bot:    ${GREEN}● running${NC}"
+        echo -e "  Bot:  ${GREEN}● running${NC}"
     else
-        echo -e "  Bot:    ${RED}● stopped${NC}"
+        echo -e "  Bot:  ${RED}● stopped${NC}"
     fi
 
-    # Check socket
-    if [ -S "$socket_path" ]; then
-        echo -e "  Socket: ${GREEN}● exists${NC} ($socket_path)"
+    # Check CDP availability
+    if curl -s --max-time 2 "http://localhost:$cdp_port/json/list" > /dev/null 2>&1; then
+        echo -e "  CDP:  ${GREEN}● reachable${NC} (port $cdp_port)"
     else
-        echo -e "  Socket: ${RED}● not found${NC}"
-    fi
-
-    # Check skill in current workspace
-    if [ -d ".agent/skills/bridge-watcher" ]; then
-        echo -e "  Skill:  ${GREEN}● installed${NC} ($(pwd)/.agent/skills/bridge-watcher)"
-    else
-        echo -e "  Skill:  ${YELLOW}● not installed${NC} in current workspace"
-        echo "          Run 'ag-bridge init' to install"
+        echo -e "  CDP:  ${RED}● not reachable${NC} (port $cdp_port)"
+        echo "        Launch Antigravity with: --remote-debugging-port=$cdp_port"
     fi
 }
 
@@ -255,7 +245,6 @@ cmd_status() {
 case "${1:-help}" in
     onboard)   cmd_onboard ;;
     configure) cmd_configure ;;
-    init)      cmd_init ;;
     start)     cmd_start ;;
     status)    cmd_status ;;
     help|--help|-h) usage ;;
