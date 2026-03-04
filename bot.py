@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Telegram ↔ Antigravity Bridge Bot.
+"""Telegram ↔ Antigravity Bridge Bot (v2).
 
-Runs a Telegram bot + Unix domain socket server.
-- Telegram messages → socket commands → Antigravity
-- Antigravity results → socket → Telegram replies
+Uses CDP (Chrome DevTools Protocol) for prompt injection and
+an HTTP callback server for receiving results.
+
+- Telegram message → CDP injects prompt into Antigravity
+- Agent executes → curls result to HTTP callback server
+- Result forwarded back to Telegram
 """
 
 import asyncio
 import json
-import os
-import socket
-import time
-import uuid
 import logging
+import os
+import uuid
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
+
+import cdp_bridge
+import callback_server
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
@@ -24,12 +28,15 @@ logger = logging.getLogger("ag-bridge")
 
 CONFIG_PATH = os.path.expanduser("~/.ag-bridge/config.json")
 
+# Pending commands: command_id -> asyncio.Future
+pending_commands: dict[str, asyncio.Future] = {}
+
 
 def load_config():
     """Load configuration from JSON file."""
     if not os.path.exists(CONFIG_PATH):
         logger.error(f"Config not found: {CONFIG_PATH}")
-        logger.error("Create it with: bot_token, allowed_chat_ids, socket_path")
+        logger.error("Create it with: ag-bridge onboard")
         raise SystemExit(1)
 
     with open(CONFIG_PATH) as f:
@@ -42,192 +49,23 @@ def load_config():
     if not config.get("allowed_chat_ids"):
         logger.warning("No allowed_chat_ids configured — bot will reject all messages")
 
-    config["socket_path"] = os.path.expanduser(
-        config.get("socket_path", "~/.ag-bridge/bridge.sock")
-    )
+    # Defaults for new config fields
+    config.setdefault("cdp_port", 9222)
+    config.setdefault("callback_port", 3001)
+    config.setdefault("timeout", 600)  # 10 minutes
+
     return config
 
 
-class BridgeServer:
-    """Manages the Unix domain socket server for bridge communication."""
-
-    def __init__(self, config):
-        self.config = config
-        self.socket_path = config["socket_path"]
-        self.server_sock = None
-        self.client_conn = None
-        self.client_buffer = b""
-        self.pending_commands = {}  # id -> asyncio.Future
-        self.active_workspace = None
-        self.app = None  # Telegram app reference
-
-    async def start_socket_server(self):
-        """Start Unix domain socket server."""
-        # Clean up stale socket file
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
-        self.server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server_sock.bind(self.socket_path)
-        self.server_sock.listen(1)
-        self.server_sock.setblocking(False)
-
-        logger.info(f"Socket server listening at {self.socket_path}")
-        asyncio.get_event_loop().add_reader(
-            self.server_sock.fileno(), self._accept_client
-        )
-
-    def _accept_client(self):
-        """Accept a new client connection."""
-        conn, _ = self.server_sock.accept()
-        conn.setblocking(False)
-
-        # Close existing client if any
-        if self.client_conn:
-            logger.info("Replacing existing bridge client connection")
-            asyncio.get_event_loop().remove_reader(self.client_conn.fileno())
-            self.client_conn.close()
-
-        self.client_conn = conn
-        self.client_buffer = b""
-        logger.info("Bridge client connected")
-        asyncio.get_event_loop().add_reader(conn.fileno(), self._read_client)
-
-    def _read_client(self):
-        """Read data from bridge client."""
-        try:
-            data = self.client_conn.recv(65536)
-            if not data:
-                self._client_disconnected()
-                return
-            self.client_buffer += data
-            self._process_buffer()
-        except (ConnectionError, OSError):
-            self._client_disconnected()
-
-    def _process_buffer(self):
-        """Process newline-delimited JSON messages from buffer."""
-        while b"\n" in self.client_buffer:
-            line, self.client_buffer = self.client_buffer.split(b"\n", 1)
-            try:
-                msg = json.loads(line.decode("utf-8"))
-                asyncio.get_event_loop().create_task(self._handle_message(msg))
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from client: {line}")
-
-    async def _handle_message(self, msg):
-        """Handle a message from the bridge client."""
-        msg_type = msg.get("type")
-
-        if msg_type == "session_start":
-            self.active_workspace = msg.get("workspace", "unknown")
-            workspace_name = os.path.basename(self.active_workspace)
-            logger.info(f"Session started: {self.active_workspace}")
-            await self._notify_telegram(
-                f"🟢 *Antigravity session active*\n"
-                f"Workspace: `{workspace_name}`\n"
-                f"Ready to receive commands\\."
-            )
-
-        elif msg_type == "result":
-            cmd_id = msg.get("id")
-            if cmd_id in self.pending_commands:
-                future = self.pending_commands[cmd_id]
-                if not future.done():
-                    future.set_result(msg)
-            else:
-                logger.warning(f"Received result for unknown command: {cmd_id}")
-
-    def _client_disconnected(self):
-        """Handle client disconnection."""
-        logger.info("Bridge client disconnected")
-        if self.client_conn:
-            try:
-                asyncio.get_event_loop().remove_reader(self.client_conn.fileno())
-            except Exception:
-                pass
-            self.client_conn.close()
-        self.client_conn = None
-        self.active_workspace = None
-
-        # Fail all pending commands
-        for cmd_id, future in self.pending_commands.items():
-            if not future.done():
-                future.set_result(
-                    {"status": "error", "summary": "Antigravity session disconnected"}
-                )
-        self.pending_commands.clear()
-
-        asyncio.get_event_loop().create_task(
-            self._notify_telegram("🔴 *Antigravity session disconnected*")
-        )
-
-    async def _notify_telegram(self, text):
-        """Send a notification to all allowed chat IDs."""
-        if not self.app:
-            return
-        for chat_id in self.config.get("allowed_chat_ids", []):
-            try:
-                await self.app.bot.send_message(
-                    chat_id=chat_id, text=text, parse_mode="MarkdownV2"
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify chat {chat_id}: {e}")
-
-    async def send_command(self, prompt, chat_id):
-        """Send a command to Antigravity and wait for result."""
-        if not self.client_conn:
-            return {
-                "status": "error",
-                "summary": (
-                    "No active Antigravity session.\n"
-                    "Start one in your IDE with: 'Watch the bridge'"
-                ),
-            }
-
-        cmd_id = str(uuid.uuid4())[:8]
-        command = {
-            "type": "command",
-            "id": cmd_id,
-            "prompt": prompt,
-            "chat_id": chat_id,
-            "ts": time.time(),
-        }
-
-        # Create future for result
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
-        self.pending_commands[cmd_id] = future
-
-        # Send command through socket
-        msg = json.dumps(command) + "\n"
-        try:
-            self.client_conn.sendall(msg.encode("utf-8"))
-            logger.info(f"Command {cmd_id} sent: {prompt[:80]}...")
-        except (ConnectionError, OSError):
-            self._client_disconnected()
-            return {"status": "error", "summary": "Connection lost to Antigravity"}
-
-        # Wait for result with timeout (10 minutes for complex tasks)
-        try:
-            result = await asyncio.wait_for(future, timeout=600)
-            return result
-        except asyncio.TimeoutError:
-            return {
-                "status": "error",
-                "summary": "⏰ Timed out waiting for Antigravity (10 min)",
-            }
-        finally:
-            self.pending_commands.pop(cmd_id, None)
-
-    async def cleanup(self):
-        """Clean up socket resources."""
-        if self.client_conn:
-            self.client_conn.close()
-        if self.server_sock:
-            self.server_sock.close()
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
+def wrap_prompt(prompt: str, cmd_id: str, callback_port: int) -> str:
+    """Wrap a user prompt with the HTTP callback instruction footer."""
+    return (
+        f"{prompt}\n\n"
+        f"When done, send your result (no need to ask for approval):\n"
+        f"curl -s -X POST http://localhost:{callback_port}/api/result "
+        f"-H 'Content-Type: application/json' "
+        f"-d '{{\"id\":\"{cmd_id}\",\"summary\":\"<1-3 sentence summary>\"}}'"
+    )
 
 
 # --- Telegram Handlers ---
@@ -235,7 +73,6 @@ class BridgeServer:
 
 async def handle_message(update: Update, context):
     """Handle incoming Telegram messages."""
-    bridge: BridgeServer = context.bot_data["bridge"]
     config = context.bot_data["config"]
 
     # Security: only allow configured chat IDs
@@ -247,14 +84,60 @@ async def handle_message(update: Update, context):
     prompt = update.message.text
     logger.info(f"Received prompt from {update.effective_chat.id}: {prompt[:80]}...")
 
-    await update.message.reply_text("📨 Command queued. Processing...")
+    # Check CDP availability
+    cdp_port = config["cdp_port"]
+    ws_url = await cdp_bridge.discover_target(cdp_port)
 
-    result = await bridge.send_command(prompt, update.effective_chat.id)
+    if not ws_url:
+        await update.message.reply_text(
+            "❌ Cannot reach Antigravity IDE.\n\n"
+            "Make sure Antigravity is running with:\n"
+            f"`/Applications/Antigravity.app/Contents/MacOS/Antigravity "
+            f"--remote-debugging-port={cdp_port}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text("📨 Injecting prompt...")
+
+    # Generate command ID and wrap prompt
+    cmd_id = str(uuid.uuid4())[:8]
+    callback_port = config["callback_port"]
+    wrapped = wrap_prompt(prompt, cmd_id, callback_port)
+
+    # Create future for result
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    pending_commands[cmd_id] = future
+
+    # Inject via CDP
+    success = await cdp_bridge.inject_prompt(ws_url, wrapped)
+    if not success:
+        pending_commands.pop(cmd_id, None)
+        await update.message.reply_text(
+            "❌ Failed to inject prompt into Antigravity.\n"
+            "The chat input might not be accessible."
+        )
+        return
+
+    await update.message.reply_text("⏳ Prompt sent. Waiting for result...")
+
+    # Wait for result with timeout
+    timeout = config.get("timeout", 600)
+    try:
+        result = await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        result = {
+            "status": "error",
+            "summary": f"⏰ Timed out waiting for Antigravity ({timeout // 60} min)",
+        }
+    finally:
+        pending_commands.pop(cmd_id, None)
 
     status_icon = "✅" if result.get("status") == "success" else "❌"
     summary = result.get("summary", "No response")
 
-    # Telegram has a 4096 char limit per message — split if needed
+    # Telegram has a 4096 char limit per message
     if len(summary) > 4000:
         summary = summary[:4000] + "\n\n... (truncated)"
 
@@ -262,21 +145,24 @@ async def handle_message(update: Update, context):
 
 
 async def handle_status(update: Update, context):
-    """Handle /status command — check if Antigravity session is active."""
-    bridge: BridgeServer = context.bot_data["bridge"]
+    """Handle /status command — check if Antigravity is reachable via CDP."""
     config = context.bot_data["config"]
 
     if update.effective_chat.id not in config.get("allowed_chat_ids", []):
         return
 
-    if bridge.active_workspace:
-        workspace_name = os.path.basename(bridge.active_workspace)
+    cdp_port = config["cdp_port"]
+    ws_url = await cdp_bridge.discover_target(cdp_port)
+
+    if ws_url:
         await update.message.reply_text(
-            f"🟢 *Active session*\nWorkspace: `{workspace_name}`",
-            parse_mode="MarkdownV2",
+            f"🟢 *Antigravity reachable* via CDP on port {cdp_port}",
+            parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text("🔴 No active Antigravity session.")
+        await update.message.reply_text(
+            f"🔴 Antigravity not reachable on CDP port {cdp_port}."
+        )
 
 
 async def handle_help(update: Update, context):
@@ -287,39 +173,43 @@ async def handle_help(update: Update, context):
         return
 
     await update.message.reply_text(
-        "🤖 *Antigravity Bridge Bot*\n\n"
-        "Send any message and it will be forwarded to your "
+        "🤖 *ag\\-bridge v2*\n\n"
+        "Send any message and it will be injected into your "
         "Antigravity session as a prompt\\.\n\n"
         "*Commands:*\n"
-        "/status \\- Check if Antigravity session is active\n"
-        "/help \\- Show this message",
+        "/status \\- Check if Antigravity is reachable\n"
+        "/help \\- Show this message\n\n"
+        "*Requires:*\n"
+        "Antigravity launched with `\\-\\-remote\\-debugging\\-port=9222`",
         parse_mode="MarkdownV2",
     )
 
 
 async def post_init(app: Application):
-    """Initialize bridge server after Telegram app starts."""
-    bridge: BridgeServer = app.bot_data["bridge"]
-    bridge.app = app
-    await bridge.start_socket_server()
-    logger.info("Bridge bot ready and listening.")
+    """Initialize callback server after Telegram app starts."""
+    config = app.bot_data["config"]
+    callback_port = config["callback_port"]
+
+    # Start the HTTP callback server
+    runner = await callback_server.start_server(callback_port, pending_commands)
+    app.bot_data["callback_runner"] = runner
+
+    logger.info("ag-bridge v2 ready. Waiting for Telegram messages.")
 
 
 def main():
     config = load_config()
-    bridge = BridgeServer(config)
 
     app = (
         Application.builder().token(config["bot_token"]).post_init(post_init).build()
     )
-    app.bot_data["bridge"] = bridge
     app.bot_data["config"] = config
 
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Starting Telegram bridge bot...")
+    logger.info("Starting ag-bridge v2 (CDP + HTTP callback)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
