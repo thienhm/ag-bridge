@@ -2,12 +2,13 @@
 """CDP Bridge — Chrome DevTools Protocol client for Antigravity prompt injection.
 
 Discovers the Antigravity IDE target via CDP and injects prompts into the chat input.
-Requires Antigravity to be launched with --remote-debugging-port=9222.
+Antigravity must be running with --remote-debugging-port (handled by `ag-bridge start`).
 """
 
 import asyncio
 import json
 import logging
+from typing import Optional
 
 import aiohttp
 
@@ -42,7 +43,7 @@ FIND_AND_FOCUS_INPUT_JS = """(() => {
 })()"""
 
 
-async def discover_target(port: int = 9222) -> str | None:
+async def discover_target(port: int = 9222) -> Optional[str]:
     """Discover the Antigravity IDE CDP target and return its WebSocket debug URL.
 
     Args:
@@ -122,50 +123,60 @@ async def inject_prompt(ws_debug_url: str, text: str) -> bool:
             async with session.ws_connect(
                 ws_debug_url, max_msg_size=16 * 1024 * 1024
             ) as ws:
-                # Step 1: Find and focus the chat input
-                result = await send_cdp(ws, "Runtime.evaluate", {
-                    "expression": FIND_AND_FOCUS_INPUT_JS,
-                    "returnByValue": True,
-                })
+                try:
+                    # Step 1: Find and focus the chat input
+                    result = await send_cdp(ws, "Runtime.evaluate", {
+                        "expression": FIND_AND_FOCUS_INPUT_JS,
+                        "returnByValue": True,
+                    })
 
-                eval_result = result.get("result", {}).get("result", {})
-                value = eval_result.get("value", {})
+                    eval_result = result.get("result", {}).get("result", {})
+                    value = eval_result.get("value", {})
 
-                if not value.get("found"):
-                    logger.error("Could not find chat input element")
-                    return False
+                    if not value.get("found"):
+                        logger.error("Could not find chat input element")
+                        return False
 
-                logger.info(
-                    f"Found input: {value.get('selector')} ({value.get('tag')})"
-                )
+                    logger.info(
+                        f"Found input: {value.get('selector')} ({value.get('tag')})"
+                    )
 
-                # Small delay to ensure focus is established
-                await asyncio.sleep(0.1)
+                    # Small delay to ensure focus is established
+                    await asyncio.sleep(0.1)
 
-                # Step 2: Insert the prompt text
-                await send_cdp(ws, "Input.insertText", {"text": text})
+                    # Step 2: Insert the prompt text
+                    await send_cdp(ws, "Input.insertText", {"text": text})
 
-                # Small delay before pressing Enter
-                await asyncio.sleep(0.1)
+                    # Small delay before pressing Enter
+                    await asyncio.sleep(0.1)
 
-                # Step 3: Press Enter to submit
-                await send_cdp(ws, "Input.dispatchKeyEvent", {
-                    "type": "keyDown",
-                    "key": "Enter",
-                    "code": "Enter",
-                    "windowsVirtualKeyCode": 13,
-                    "nativeVirtualKeyCode": 13,
-                })
-                await send_cdp(ws, "Input.dispatchKeyEvent", {
-                    "type": "keyUp",
-                    "key": "Enter",
-                    "code": "Enter",
-                    "windowsVirtualKeyCode": 13,
-                    "nativeVirtualKeyCode": 13,
-                })
+                    # Step 3: Press Enter to submit
+                    await send_cdp(ws, "Input.dispatchKeyEvent", {
+                        "type": "keyDown",
+                        "key": "Enter",
+                        "code": "Enter",
+                        "windowsVirtualKeyCode": 13,
+                        "nativeVirtualKeyCode": 13,
+                    })
+                    await send_cdp(ws, "Input.dispatchKeyEvent", {
+                        "type": "keyUp",
+                        "key": "Enter",
+                        "code": "Enter",
+                        "windowsVirtualKeyCode": 13,
+                        "nativeVirtualKeyCode": 13,
+                    })
 
-                logger.info("Prompt injected successfully")
-                return True
+                    logger.info("Prompt injected successfully")
+                    return True
+
+                finally:
+                    # Cleanly disable runtime to release debugger hold
+                    try:
+                        await ws.send_json(
+                            {"id": 9999, "method": "Runtime.disable"}
+                        )
+                    except Exception:
+                        pass
 
     except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError) as e:
         logger.error(f"CDP injection failed: {e}")

@@ -34,7 +34,7 @@
 ## Prerequisites
 
 - **macOS** with Python 3.9+
-- **Antigravity** launched with `--remote-debugging-port=9222`
+- **Antigravity** installed at `/Applications/Antigravity.app`
 - **Telegram account** + bot created via [@BotFather](https://t.me/BotFather)
 
 ## Installation
@@ -63,19 +63,15 @@ This will:
 
 ## Usage
 
-### 1. Launch Antigravity with CDP
-
-```bash
-/Applications/Antigravity.app/Contents/MacOS/Antigravity --remote-debugging-port=9222
-```
-
-### 2. Start the bot
+### 1. Start the bridge
 
 ```bash
 ag-bridge start
 ```
 
-### 3. Send commands from Telegram
+This will automatically launch Antigravity with CDP enabled (if not already running) and start the bot.
+
+### 2. Send commands from Telegram
 
 Just message your bot like you would in the IDE:
 
@@ -88,10 +84,11 @@ The bot injects your prompt directly into Antigravity — no special setup per w
 
 ### Bot commands
 
-| Command   | Description                             |
-| --------- | --------------------------------------- |
-| `/status` | Check if Antigravity is reachable (CDP) |
-| `/help`   | Show available commands                 |
+| Command     | Description                             |
+| ----------- | --------------------------------------- |
+| `/status`   | Check if Antigravity is reachable (CDP) |
+| `/shutdown` | Gracefully shut down the bridge         |
+| `/help`     | Show available commands                 |
 
 ## Architecture
 
@@ -105,7 +102,6 @@ The bot injects your prompt directly into Antigravity — no special setup per w
 ## Limitations
 
 - **One command at a time** — commands are processed sequentially
-- **Requires CDP flag** — Antigravity must be launched with `--remote-debugging-port=9222`
 - **Text responses only** — no file attachments or screenshots (yet)
 - **Same Mac** — bot and Antigravity must be on the same machine
 - **10 min timeout** — long-running tasks will time out

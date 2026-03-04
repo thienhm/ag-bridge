@@ -26,10 +26,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ag-bridge")
 
-CONFIG_PATH = os.path.expanduser("~/.ag-bridge/config.json")
+# Config lives alongside this script (same as the CLI's AG_BRIDGE_HOME)
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # Pending commands: command_id -> asyncio.Future
 pending_commands: dict[str, asyncio.Future] = {}
+
+# CDP status tracking
+_cdp_reachable: bool = False
 
 
 def load_config():
@@ -53,6 +57,7 @@ def load_config():
     config.setdefault("cdp_port", 9222)
     config.setdefault("callback_port", 3001)
     config.setdefault("timeout", 600)  # 10 minutes
+    config.setdefault("status_poll_interval", 10)  # seconds
 
     return config
 
@@ -61,11 +66,72 @@ def wrap_prompt(prompt: str, cmd_id: str, callback_port: int) -> str:
     """Wrap a user prompt with the HTTP callback instruction footer."""
     return (
         f"{prompt}\n\n"
-        f"When done, send your result (no need to ask for approval):\n"
+        f"---\n"
+        f"When you are completely done, report your result by running this curl command "
+        f"(no need to ask for approval):\n\n"
         f"curl -s -X POST http://localhost:{callback_port}/api/result "
         f"-H 'Content-Type: application/json' "
-        f"-d '{{\"id\":\"{cmd_id}\",\"summary\":\"<1-3 sentence summary>\"}}'"
+        f"-d '{{\n"
+        f'  "id": "{cmd_id}",\n'
+        f'  "summary": "<detailed summary in markdown format: what was done, key changes or findings, and any issues or next steps>"\n'
+        f"}}'"
     )
+
+
+# --- CDP Status Watcher ---
+
+
+async def notify_telegram(app: Application, text: str):
+    """Send a notification to all allowed chat IDs."""
+    config = app.bot_data["config"]
+    for chat_id in config.get("allowed_chat_ids", []):
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify chat {chat_id}: {e}")
+
+
+async def cdp_status_watcher(app: Application):
+    """Background task that polls CDP and notifies on status changes."""
+    global _cdp_reachable
+    config = app.bot_data["config"]
+    cdp_port = config["cdp_port"]
+    interval = config.get("status_poll_interval", 10)
+
+    # Do an initial check without notifying (avoid spurious 🔴 on startup)
+    ws_url = await cdp_bridge.discover_target(cdp_port)
+    _cdp_reachable = ws_url is not None
+    if _cdp_reachable:
+        await notify_telegram(
+            app,
+            f"🟢 *Antigravity reachable* via CDP on port {cdp_port}",
+        )
+    logger.info(f"CDP status watcher started (poll every {interval}s, initial={'reachable' if _cdp_reachable else 'unreachable'})")
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            ws_url = await cdp_bridge.discover_target(cdp_port)
+            now_reachable = ws_url is not None
+
+            if now_reachable and not _cdp_reachable:
+                logger.info("CDP status changed: unreachable → reachable")
+                await notify_telegram(
+                    app,
+                    f"🟢 *Antigravity is now reachable* via CDP on port {cdp_port}",
+                )
+            elif not now_reachable and _cdp_reachable:
+                logger.info("CDP status changed: reachable → unreachable")
+                await notify_telegram(
+                    app,
+                    "🔴 *Antigravity is no longer reachable*",
+                )
+
+            _cdp_reachable = now_reachable
+        except Exception as e:
+            logger.error(f"Status watcher error: {e}")
 
 
 # --- Telegram Handlers ---
@@ -91,9 +157,8 @@ async def handle_message(update: Update, context):
     if not ws_url:
         await update.message.reply_text(
             "❌ Cannot reach Antigravity IDE.\n\n"
-            "Make sure Antigravity is running with:\n"
-            f"`/Applications/Antigravity.app/Contents/MacOS/Antigravity "
-            f"--remote-debugging-port={cdp_port}`",
+            "Make sure Antigravity is running with CDP enabled.\n"
+            "Use `ag-bridge start` to launch it automatically.",
             parse_mode="Markdown",
         )
         return
@@ -178,15 +243,28 @@ async def handle_help(update: Update, context):
         "Antigravity session as a prompt\\.\n\n"
         "*Commands:*\n"
         "/status \\- Check if Antigravity is reachable\n"
-        "/help \\- Show this message\n\n"
-        "*Requires:*\n"
-        "Antigravity launched with `\\-\\-remote\\-debugging\\-port=9222`",
+        "/shutdown \\- Shut down the bridge\n"
+        "/help \\- Show this message",
         parse_mode="MarkdownV2",
     )
 
 
+async def handle_shutdown(update: Update, context):
+    """Handle /shutdown command — gracefully stop the bot."""
+    config = context.bot_data["config"]
+
+    if update.effective_chat.id not in config.get("allowed_chat_ids", []):
+        return
+
+    await update.message.reply_text("👋 Shutting down ag-bridge...")
+    logger.info(f"Shutdown requested from chat {update.effective_chat.id}")
+
+    # Stop the application — triggers post_shutdown cleanup
+    asyncio.get_event_loop().call_soon(context.application.stop_running)
+
+
 async def post_init(app: Application):
-    """Initialize callback server after Telegram app starts."""
+    """Initialize callback server and CDP status watcher after Telegram app starts."""
     config = app.bot_data["config"]
     callback_port = config["callback_port"]
 
@@ -194,18 +272,59 @@ async def post_init(app: Application):
     runner = await callback_server.start_server(callback_port, pending_commands)
     app.bot_data["callback_runner"] = runner
 
+    # Start CDP status watcher
+    watcher_task = asyncio.create_task(cdp_status_watcher(app))
+    app.bot_data["status_watcher"] = watcher_task
+
     logger.info("ag-bridge v2 ready. Waiting for Telegram messages.")
+
+
+async def post_shutdown(app: Application):
+    """Clean up resources on bot shutdown."""
+    logger.info("Shutting down ag-bridge...")
+
+    # Cancel status watcher
+    watcher = app.bot_data.get("status_watcher")
+    if watcher and not watcher.done():
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+    logger.info("Status watcher stopped.")
+
+    # Fail all pending commands
+    for cmd_id, future in pending_commands.items():
+        if not future.done():
+            future.set_result({
+                "status": "error",
+                "summary": "Bot shutting down.",
+            })
+    pending_commands.clear()
+
+    # Stop callback server
+    runner = app.bot_data.get("callback_runner")
+    if runner:
+        await runner.cleanup()
+    logger.info("Callback server stopped.")
+
+    logger.info("ag-bridge shutdown complete.")
 
 
 def main():
     config = load_config()
 
     app = (
-        Application.builder().token(config["bot_token"]).post_init(post_init).build()
+        Application.builder()
+        .token(config["bot_token"])
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
     app.bot_data["config"] = config
 
     app.add_handler(CommandHandler("status", handle_status))
+    app.add_handler(CommandHandler("shutdown", handle_shutdown))
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

@@ -4,7 +4,7 @@
 # Usage:
 #   ag-bridge onboard     First-time setup — configure bot token and chat ID
 #   ag-bridge configure   Edit an existing configuration value
-#   ag-bridge start       Start the bot daemon
+#   ag-bridge start       Launch Antigravity (if needed) and start the bot
 #   ag-bridge status      Show bot and CDP status
 #   ag-bridge help        Show this help message
 
@@ -30,12 +30,9 @@ usage() {
     echo "Usage:"
     echo "  ag-bridge onboard     First-time setup — configure bot token and chat ID"
     echo "  ag-bridge configure   Edit an existing configuration value"
-    echo "  ag-bridge start       Start the bot daemon"
+    echo "  ag-bridge start       Launch Antigravity (if needed) and start the bot"
     echo "  ag-bridge status      Show bot and CDP status"
     echo "  ag-bridge help        Show this help message"
-    echo ""
-    echo "Prerequisite:"
-    echo "  Antigravity must be launched with --remote-debugging-port=9222"
 }
 
 cmd_onboard() {
@@ -128,8 +125,7 @@ EOF
     echo -e "${GREEN}✅ Config saved to $CONFIG_FILE${NC}"
     echo ""
     echo -e "  ${BOLD}Next steps:${NC}"
-    echo "    1. Launch Antigravity with: /Applications/Antigravity.app/Contents/MacOS/Antigravity --remote-debugging-port=$cdp_port"
-    echo "    2. Start the bot: ag-bridge start"
+    echo "    Start the bridge: ag-bridge start"
 }
 
 cmd_configure() {
@@ -245,6 +241,41 @@ cmd_start() {
         exit 1
     fi
 
+    local cdp_port
+    cdp_port=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('cdp_port', 9222))" 2>/dev/null || echo "9222")
+
+    # Launch Antigravity with CDP if not already reachable
+    if curl -s --max-time 2 "http://localhost:$cdp_port/json/list" > /dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Antigravity already reachable on CDP port $cdp_port"
+    else
+        local app_path="/Applications/Antigravity.app"
+        if [ ! -d "$app_path" ]; then
+            echo -e "${RED}Error:${NC} Antigravity.app not found at $app_path"
+            echo "  Please install Antigravity or launch it manually with:"
+            echo "    /path/to/Antigravity.app/Contents/MacOS/Electron --remote-debugging-port=$cdp_port"
+            exit 1
+        fi
+
+        echo -e "  Launching Antigravity with CDP on port $cdp_port..."
+        open -a "$app_path" --args --remote-debugging-port="$cdp_port" &
+
+        # Wait for CDP to become available (up to 15 seconds)
+        local retries=30
+        while ! curl -s --max-time 1 "http://localhost:$cdp_port/json/list" > /dev/null 2>&1; do
+            retries=$((retries - 1))
+            if [ $retries -le 0 ]; then
+                echo -e "${YELLOW}⚠ Antigravity launched but CDP not yet reachable on port $cdp_port${NC}"
+                echo "  The bot will start anyway and notify you when CDP becomes available."
+                break
+            fi
+            sleep 0.5
+        done
+
+        if [ $retries -gt 0 ]; then
+            echo -e "  ${GREEN}✓${NC} Antigravity is ready on CDP port $cdp_port"
+        fi
+    fi
+
     echo -e "${BOLD}Starting ag-bridge v2...${NC}"
     python3 "$bot"
 }
@@ -268,7 +299,7 @@ cmd_status() {
         echo -e "  CDP:  ${GREEN}● reachable${NC} (port $cdp_port)"
     else
         echo -e "  CDP:  ${RED}● not reachable${NC} (port $cdp_port)"
-        echo "        Launch Antigravity with: --remote-debugging-port=$cdp_port"
+        echo "        Start with: ag-bridge start"
     fi
 }
 
