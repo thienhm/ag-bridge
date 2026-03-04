@@ -39,34 +39,25 @@
 
 ## Installation
 
-### 1. Clone this repo
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/thienhm/ag-bridge.git
+cd ag-bridge
+pip3 install -r requirements.txt
 ```
 
-### 2. Install dependencies
+### 2. Run onboard
 
 ```bash
-pip3 install -r ag-bridge/requirements.txt
+./ag-bridge onboard
 ```
 
-### 3. Add `ag-bridge` to your PATH
+This will:
 
-Add to your `~/.zshrc` (adjust the path to where you cloned):
-
-```bash
-export AG_BRIDGE_HOME="/path/to/ag-bridge"
-export PATH="$AG_BRIDGE_HOME:$PATH"
-```
-
-### 4. Set up your bot
-
-```bash
-ag-bridge onboard
-```
-
-This walks you through creating a Telegram bot and configuring ports.
+- Add `ag-bridge` to your PATH (via `~/.zshrc`)
+- Walk you through creating a Telegram bot
+- Configure CDP and callback ports
 
 > **Already configured?** Use `ag-bridge configure` to update settings.
 

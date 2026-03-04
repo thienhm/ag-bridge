@@ -10,7 +10,11 @@
 
 set -euo pipefail
 
-AG_BRIDGE_HOME="${AG_BRIDGE_HOME:-$HOME/.ag-bridge}"
+# Resolve AG_BRIDGE_HOME: env var > script's own directory
+if [ -z "${AG_BRIDGE_HOME:-}" ]; then
+    # Resolve the directory where this script lives (follows symlinks)
+    AG_BRIDGE_HOME="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")" )" && pwd)"
+fi
 CONFIG_FILE="$AG_BRIDGE_HOME/config.json"
 
 # Colors
@@ -36,6 +40,34 @@ usage() {
 
 cmd_onboard() {
     echo -e "${BOLD}🤖 ag-bridge v2 — First-time setup${NC}"
+    echo ""
+
+    # Step 0: PATH setup
+    local shell_rc="$HOME/.zshrc"
+    local script_dir="$AG_BRIDGE_HOME"
+
+    if grep -q "AG_BRIDGE_HOME" "$shell_rc" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} PATH already configured in $shell_rc"
+    else
+        echo -e "  ${BOLD}Step 0:${NC} Adding ag-bridge to your PATH"
+        echo ""
+        echo "  Will add to $shell_rc:"
+        echo -e "    ${YELLOW}export AG_BRIDGE_HOME=\"$script_dir\"${NC}"
+        echo -e "    ${YELLOW}export PATH=\"\$AG_BRIDGE_HOME:\$PATH\"${NC}"
+        echo ""
+        read -p "  OK? [Y/n] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            echo "" >> "$shell_rc"
+            echo "# ag-bridge" >> "$shell_rc"
+            echo "export AG_BRIDGE_HOME=\"$script_dir\"" >> "$shell_rc"
+            echo 'export PATH="$AG_BRIDGE_HOME:$PATH"' >> "$shell_rc"
+            echo -e "  ${GREEN}✅ Added to $shell_rc${NC}"
+            echo -e "  ${YELLOW}Run 'source $shell_rc' after onboarding to apply.${NC}"
+        else
+            echo "  Skipped. You can add it manually later."
+        fi
+    fi
     echo ""
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -83,7 +115,6 @@ cmd_onboard() {
     callback_port="${callback_port:-3001}"
 
     # Write config
-    mkdir -p "$AG_BRIDGE_HOME"
     cat > "$CONFIG_FILE" <<EOF
 {
   "bot_token": "$bot_token",
