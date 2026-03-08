@@ -6,24 +6,7 @@
 
 ## How It Works
 
-```
-┌──────────────┐              ┌──────────────────────────────┐
-│  Your Phone  │   Telegram   │          bot.py              │
-│  (Telegram)  │ ◄──────────► │                              │
-└──────────────┘              │  ┌────────────┐ ┌─────────┐ │
-                              │  │ cdp_bridge │ │callback_ │ │
-                              │  │   .py      │ │server.py │ │
-                              │  └─────┬──────┘ └────▲────┘ │
-                              └────────┼─────────────┼──────┘
-                                       │             │
-                              CDP inject prompt   curl result
-                              localhost:9222     localhost:3001
-                                       │             │
-                                       ▼             │
-                              ┌──────────────────────┴───────┐
-                              │       Antigravity IDE         │
-                              └──────────────────────────────┘
-```
+![ag-bridge Architecture](docs/architecture.png)
 
 1. You send a message to your Telegram bot
 2. The bot injects it into Antigravity's chat via CDP
